@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_meta
+
+# Environment & secrets
+.env
+.env.*
+*.key
+
+# Data & models (usually too large for git)
+data/
+*.pkl
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.gguf
+
+# macOS
+.DS_Store

@@ -1,0 +1,18 @@
+# Core ML
+torch
+numpy
+matplotlib
+
+# Generative AI
+anthropic
+openai
+transformers
+diffusers
+
+# Reinforcement Learning
+gymnasium
+stable-baselines3
+
+# Notebooks
+jupyter
+ipykernel
