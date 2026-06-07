@@ -6,6 +6,7 @@ A sandbox for experimenting with generative AI and reinforcement learning techni
 
 ```
 practice_2026/
+├── pytorch_foundations/    # Core PyTorch & ML tricks (tensors, autograd, attention)
 ├── generative_ai/          # GenAI experiments
 │   ├── llm/                # LLM prompting, fine-tuning, RAG
 │   ├── diffusion/          # Image/audio generation

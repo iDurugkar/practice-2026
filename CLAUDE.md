@@ -8,7 +8,8 @@ A personal study sandbox for practicing ML, GenAI, and RL by implementing
 research-level concepts from scratch. It is **not** a library or application —
 there is no package to build and nothing imports across the topic directories.
 
-Each `.py` file under `generative_ai/` and `reinforcement_learning/` is a
+Each `.py` file under `pytorch_foundations/`, `generative_ai/`, and
+`reinforcement_learning/` is a
 **self-contained assignment**: a guided skeleton with theory, paper references,
 and deliberately unimplemented stubs (`raise NotImplementedError`) that the user
 fills in. The numeric prefixes (`01_`, `02_`) indicate intended order within a
@@ -69,3 +70,9 @@ Every assignment follows the same convention — recognizing it makes edits fast
 `utils.py` (repo root) provides `get_device()` (cuda → mps → cpu) and
 `set_seed()`. Assignments are currently standalone and don't import it; prefer
 these helpers over re-deriving device/seed logic when adding harness code.
+
+## ToDo
+* Implement a forward backward pass
+* Tensor manipulation examples
+* implement SFT training loop
+* implement on-policy distillation loop
