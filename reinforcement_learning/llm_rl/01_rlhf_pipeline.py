@@ -25,15 +25,19 @@ Paper refs:
 Setup: pip install torch numpy matplotlib transformers
 """
 
+import random
+
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import numpy as np
-import random
 from torch import Tensor
+from torch._numpy import dtype
 from torch.distributions import Categorical
-import matplotlib.pyplot as plt
+
+from utils import get_device
 
 # ---------------------------------------------------------------------------
 # Toy LM: generates arithmetic expressions like "3 + 4 = 7"
@@ -57,8 +61,11 @@ def expression_reward(tokens: list[int]) -> float:
     Parse a generated sequence and return 1.0 if it's a correct equation, 0.0 otherwise.
     Expected format: "A op B = C" where op ∈ {+, -, *}.
     """
-    text = "".join(VOCAB[t] if t < len(VOCAB) else "" for t in tokens
-                   if t not in (BOS_ID, EOS_ID, PAD_ID))
+    text = "".join(
+        VOCAB[t] if t < len(VOCAB) else ""
+        for t in tokens
+        if t not in (BOS_ID, EOS_ID, PAD_ID)
+    )
     text = text.strip()
     try:
         lhs, rhs = text.split("=")
@@ -90,6 +97,7 @@ def sample_preference_pair() -> tuple[list[int], list[int], int]:
 # Part 1: Reward Model
 # ---------------------------------------------------------------------------
 
+
 class RewardModel(nn.Module):
     """
     Transformer encoder → scalar reward head.
@@ -97,26 +105,48 @@ class RewardModel(nn.Module):
     Trained to satisfy: R(chosen) > R(rejected) via Bradley-Terry loss.
     """
 
-    def __init__(self, vocab_size: int = VOCAB_SIZE, d_model: int = 64,
-                 n_heads: int = 2, n_layers: int = 2, max_len: int = MAX_LEN + 2):
+    def __init__(
+        self,
+        vocab_size: int = VOCAB_SIZE,
+        d_model: int = 64,
+        n_heads: int = 2,
+        n_layers: int = 2,
+        max_len: int = MAX_LEN + 2,
+    ):
         super().__init__()
-        # TODO: Token embedding + positional embedding + TransformerEncoder
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(vocab_size, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model, n_heads, dim_feedforward=d_model * 4, batch_first=True
+        )
+        self.encoer = nn.TransformerEncoder(
+            encoder_layer=encoder_layer, num_layers=n_layers
+        )
+        self.reward_head = nn.Linear(d_model, 1)
         # Final: mean-pool over sequence dim → Linear(d_model, 1)
-        raise NotImplementedError
 
     def forward(self, tokens: Tensor, mask: Tensor | None = None) -> Tensor:
         """Return scalar reward of shape (B,)."""
-        raise NotImplementedError
+        B, T = tokens.shape
+        positions = torch.arange(T, device=tokens.device).unsqueeze(0)
+        x = self.token_emb(tokens) + self.pos_emb(positions)
+        x = self.encoer(
+            x, src_key_padding_mask=(mask == 0) if mask is not None else None
+        )
+        x = x.mean(dim=1)
+        return self.reward_head(x).squeeze(-1)  # (B,)
 
 
-def bradley_terry_loss(reward_chosen: Tensor, reward_rejected: Tensor) -> Tensor:
+def bradley_terry_loss(
+    reward_chosen: Tensor, reward_rejected: Tensor
+) -> tuple[Tensor, Tensor]:
     """
     BT loss: L = -E[log σ(R(chosen) - R(rejected))]
     Also compute and return accuracy = mean(R(chosen) > R(rejected)).
-
-    TODO: Implement.
     """
-    raise NotImplementedError
+    loss = -F.logsigmoid(reward_chosen - reward_rejected).mean()
+    accuracy = (reward_chosen > reward_rejected).float().mean()
+    return loss, accuracy
 
 
 def train_reward_model(n_pairs: int = 5000, n_epochs: int = 5) -> RewardModel:
@@ -128,18 +158,45 @@ def train_reward_model(n_pairs: int = 5000, n_epochs: int = 5) -> RewardModel:
       4. Verify: reward of correct equations > incorrect equations on held-out set.
       5. Return trained model.
     """
-    raise NotImplementedError
+
+    device = get_device()
+    reward_model = RewardModel().to(device)
+    optimizer = torch.optim.SGD(reward_model.parameters())
+    minibatch_size = 50
+
+    num_batches = n_pairs // minibatch_size
+    for i in range(num_batches):
+        batch = [sample_preference_pair() for _ in range(minibatch_size)]
+        chosen_prompts, rejected_prompts, winners = zip(*batch)
+        assert all([w == 0 for w in winners])
+        optimizer.zero_grad()
+        chosen_prompts = torch.tensor(chosen_prompts).to(device)
+        rejected_prompts = torch.tensor(rejected_prompts).to(device)
+        loss, acc = bradley_terry_loss(reward_model(chosen_prompts), reward_model(rejected_prompts))
+        loss.backward()
+        optimizer.step()
+        if (i + 1) % 10 == 0:
+            print(f"Accuracy at {(i + 1) / num_batches * 100}% = {acc}")
+
+    return reward_model
 
 
 # ---------------------------------------------------------------------------
 # Part 2: Reference Policy (SFT model)
 # ---------------------------------------------------------------------------
 
+
 class LanguageModel(nn.Module):
     """Simple GPT-like decoder-only Transformer for toy arithmetic."""
 
-    def __init__(self, vocab_size: int = VOCAB_SIZE, d_model: int = 64,
-                 n_heads: int = 2, n_layers: int = 2, max_len: int = MAX_LEN + 2):
+    def __init__(
+        self,
+        vocab_size: int = VOCAB_SIZE,
+        d_model: int = 64,
+        n_heads: int = 2,
+        n_layers: int = 2,
+        max_len: int = MAX_LEN + 2,
+    ):
         super().__init__()
         # TODO: Causal Transformer decoder
         # Embedding → TransformerDecoder (causal mask) → Linear(d_model, vocab_size)
@@ -149,8 +206,9 @@ class LanguageModel(nn.Module):
         """Return logits of shape (B, T, V)."""
         raise NotImplementedError
 
-    def generate(self, prompt: Tensor, max_new: int = MAX_LEN,
-                 temperature: float = 1.0) -> tuple[Tensor, Tensor]:
+    def generate(
+        self, prompt: Tensor, max_new: int = MAX_LEN, temperature: float = 1.0
+    ) -> tuple[Tensor, Tensor]:
         """
         Autoregressive generation. Return (token_ids, log_probs) where
         log_probs[t] = log π(a_t | a_{<t}, prompt).
@@ -171,8 +229,10 @@ def pretrain_sft(n_steps: int = 10_000) -> LanguageModel:
 # Part 3: PPO with KL penalty (RLHF stage)
 # ---------------------------------------------------------------------------
 
-def compute_kl_penalty(policy: LanguageModel, ref_policy: LanguageModel,
-                       tokens: Tensor) -> Tensor:
+
+def compute_kl_penalty(
+    policy: LanguageModel, ref_policy: LanguageModel, tokens: Tensor
+) -> Tensor:
     """
     Token-level KL: KL(π_θ || π_ref) = Σ_t π_θ(a_t|·) log [π_θ(a_t|·) / π_ref(a_t|·)]
     Approximated as: Σ_t [log π_θ(a_t) - log π_ref(a_t)]
@@ -213,6 +273,7 @@ def rlhf_ppo_step(
 # Part 4: Reward hacking experiment
 # ---------------------------------------------------------------------------
 
+
 def reward_hacking_experiment(kl_betas: list[float] = [0.0, 0.01, 0.1, 0.5]):
     """
     Train RLHF-PPO with different KL penalties β.
@@ -232,25 +293,28 @@ def reward_hacking_experiment(kl_betas: list[float] = [0.0, 0.01, 0.1, 0.5]):
 
 
 if __name__ == "__main__":
-    print("Stage 1: SFT pretraining...")
-    ref_policy = pretrain_sft(n_steps=5000)
+    # print("Stage 1: SFT pretraining...")
+    # ref_policy = pretrain_sft(n_steps=5000)
 
     print("\nStage 2: Reward model training...")
     reward_model = train_reward_model(n_pairs=3000)
 
-    print("\nStage 3: RLHF fine-tuning...")
-    policy = type(ref_policy)()  # fresh policy same architecture
-    policy.load_state_dict(ref_policy.state_dict())  # init from SFT
-    optimizer = optim.Adam(policy.parameters(), lr=1e-4)
+    # print("\nStage 3: RLHF fine-tuning...")
+    # policy = type(ref_policy)()  # fresh policy same architecture
+    # policy.load_state_dict(ref_policy.state_dict())  # init from SFT
+    # optimizer = optim.Adam(policy.parameters(), lr=1e-4)
 
-    logs = []
-    for step in range(500):
-        log = rlhf_ppo_step(policy, ref_policy, reward_model, optimizer,
-                            kl_beta=0.1, n_rollouts=64)
-        logs.append(log)
-        if step % 50 == 0:
-            print(f"Step {step}: reward={log['mean_reward']:.3f} "
-                  f"kl={log['mean_kl']:.3f} acc={log['mean_correct']:.3f}")
+    # logs = []
+    # for step in range(500):
+    #     log = rlhf_ppo_step(
+    #         policy, ref_policy, reward_model, optimizer, kl_beta=0.1, n_rollouts=64
+    #     )
+    #     logs.append(log)
+    #     if step % 50 == 0:
+    #         print(
+    #             f"Step {step}: reward={log['mean_reward']:.3f} "
+    #             f"kl={log['mean_kl']:.3f} acc={log['mean_correct']:.3f}"
+    #         )
 
-    print("\nReward Hacking Experiment...")
-    reward_hacking_experiment()
+    # print("\nReward Hacking Experiment...")
+    # reward_hacking_experiment()
