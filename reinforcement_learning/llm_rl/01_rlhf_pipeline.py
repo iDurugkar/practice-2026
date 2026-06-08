@@ -34,8 +34,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch import Tensor
-from torch._numpy import dtype
 from torch.distributions import Categorical
+from torch.utils.data import DataLoader, Dataset
 
 from utils import get_device
 
@@ -115,7 +115,7 @@ class RewardModel(nn.Module):
     ):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(max_len, d_model)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model, n_heads, dim_feedforward=d_model * 4, batch_first=True
         )
@@ -128,7 +128,7 @@ class RewardModel(nn.Module):
     def forward(self, tokens: Tensor, mask: Tensor | None = None) -> Tensor:
         """Return scalar reward of shape (B,)."""
         B, T = tokens.shape
-        positions = torch.arange(T, device=tokens.device).unsqueeze(0)
+        positions = torch.arange(T, device=tokens.device, dtype=torch.long)
         x = self.token_emb(tokens) + self.pos_emb(positions)
         x = self.encoer(
             x, src_key_padding_mask=(mask == 0) if mask is not None else None
@@ -161,22 +161,57 @@ def train_reward_model(n_pairs: int = 5000, n_epochs: int = 5) -> RewardModel:
 
     device = get_device()
     reward_model = RewardModel().to(device)
-    optimizer = torch.optim.SGD(reward_model.parameters())
-    minibatch_size = 50
+    optimizer = torch.optim.Adam(reward_model.parameters(), lr=0.001)
 
-    num_batches = n_pairs // minibatch_size
-    for i in range(num_batches):
-        batch = [sample_preference_pair() for _ in range(minibatch_size)]
-        chosen_prompts, rejected_prompts, winners = zip(*batch)
-        assert all([w == 0 for w in winners])
-        optimizer.zero_grad()
-        chosen_prompts = torch.tensor(chosen_prompts).to(device)
-        rejected_prompts = torch.tensor(rejected_prompts).to(device)
-        loss, acc = bradley_terry_loss(reward_model(chosen_prompts), reward_model(rejected_prompts))
-        loss.backward()
-        optimizer.step()
-        if (i + 1) % 10 == 0:
-            print(f"Accuracy at {(i + 1) / num_batches * 100}% = {acc}")
+    class PrefDataset(Dataset):
+        def __init__(self, data: list[tuple[list[int], list[int], int]]) -> None:
+            super().__init__()
+            self.positives: list[Tensor] = []
+            self.negatives: list[Tensor] = []
+            self.n_samples: int = len(data)
+            for a, b, winner in data:
+                a = torch.tensor(a + [PAD_ID] * (MAX_LEN + 2 - len(a)))
+                b = torch.tensor(b + [PAD_ID] * (MAX_LEN + 2 - len(b)))
+                if winner == 0:
+                    self.positives.append(a)
+                    self.negatives.append(b)
+                else:
+                    self.positives.append(b)
+                    self.negatives.append(a)
+
+        def __len__(self):
+            return self.n_samples
+
+        def __getitem__(self, index) -> tuple[Tensor, Tensor]:
+            return self.positives[index], self.negatives[index]
+
+    train_data = [sample_preference_pair() for _ in range(n_pairs)]
+    dataset = PrefDataset(train_data)
+    dataloader = DataLoader(dataset, batch_size=50, shuffle=True)
+    test_data = [sample_preference_pair() for _ in range(500)]
+    test_dataset = PrefDataset(test_data)
+    test_dataloader = DataLoader(test_dataset, batch_size=50, shuffle=True)
+
+    for epoch in range(n_epochs):
+        for chosen_prompts, rejected_prompts in dataloader:
+            optimizer.zero_grad()
+            chosen_prompts = chosen_prompts.to(device)
+            rejected_prompts = rejected_prompts.to(device)
+            loss, _ = bradley_terry_loss(
+                reward_model(chosen_prompts), reward_model(rejected_prompts)
+            )
+            loss.backward()
+            optimizer.step()
+        accuracy: list[Tensor] = []
+        with torch.no_grad():
+            for chosen_prompts, rejected_prompts in test_dataloader:
+                chosen_prompts = chosen_prompts.to(device)
+                rejected_prompts = rejected_prompts.to(device)
+                _, acc = bradley_terry_loss(
+                    reward_model(chosen_prompts), reward_model(rejected_prompts)
+                )
+                accuracy.append(acc)
+        print(f"Epoch {epoch}, accuracy: {torch.stack(accuracy).mean().item():.3f}")
 
     return reward_model
 
