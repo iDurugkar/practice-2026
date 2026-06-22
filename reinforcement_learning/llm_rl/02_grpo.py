@@ -24,18 +24,21 @@ Paper refs:
 Setup: pip install torch numpy matplotlib
 """
 
+# Re-use the toy arithmetic environment from assignment 01
+# (copy the relevant pieces or import from there)
+import random
+
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import numpy as np
+from rlhf_pipeline import LanguageModel
 from torch import Tensor
 from torch.distributions import Categorical
-import matplotlib.pyplot as plt
 
-# Re-use the toy arithmetic environment from assignment 01
-# (copy the relevant pieces or import from there)
-import random
+from utils import get_device
 
 VOCAB = list("0123456789+-* =<>")
 TOK2ID = {c: i for i, c in enumerate(VOCAB)}
@@ -47,8 +50,11 @@ MAX_LEN = 12
 
 
 def expression_reward(tokens: list[int]) -> float:
-    text = "".join(VOCAB[t] if t < len(VOCAB) else "" for t in tokens
-                   if t not in (BOS_ID, EOS_ID, PAD_ID))
+    text = "".join(
+        VOCAB[t] if t < len(VOCAB) else ""
+        for t in tokens
+        if t not in (BOS_ID, EOS_ID, PAD_ID)
+    )
     text = text.strip()
     try:
         lhs, rhs = text.split("=")
@@ -59,14 +65,18 @@ def expression_reward(tokens: list[int]) -> float:
 
 def format_reward(tokens: list[int]) -> float:
     """Bonus reward for correct format: 'A op B = C' regardless of correctness."""
-    text = "".join(VOCAB[t] if t < len(VOCAB) else "" for t in tokens
-                   if t not in (BOS_ID, EOS_ID, PAD_ID))
+    text = "".join(
+        VOCAB[t] if t < len(VOCAB) else ""
+        for t in tokens
+        if t not in (BOS_ID, EOS_ID, PAD_ID)
+    )
     return float("=" in text and any(op in text for op in ["+", "-", "*"]))
 
 
 # ---------------------------------------------------------------------------
 # Part 1: GRPO advantage estimation
 # ---------------------------------------------------------------------------
+
 
 def group_relative_advantage(rewards: Tensor, eps: float = 1e-8) -> Tensor:
     """
@@ -81,7 +91,7 @@ def group_relative_advantage(rewards: Tensor, eps: float = 1e-8) -> Tensor:
     TODO: Implement. Note: if all rewards are equal (std ≈ 0), advantages → 0.
     This is the key design choice: advantages are relative, not absolute.
     """
-    raise NotImplementedError
+    return (rewards - rewards.mean()) / (rewards.std(unbiased=False) + eps)
 
 
 def group_relative_advantage_batched(rewards: Tensor) -> Tensor:
@@ -92,48 +102,76 @@ def group_relative_advantage_batched(rewards: Tensor) -> Tensor:
 
     TODO: Implement. This is what you'd use in a real training loop.
     """
-    raise NotImplementedError
+    gra_function = torch.vmap(group_relative_advantage)
+    return gra_function(rewards)
 
 
 # ---------------------------------------------------------------------------
 # Part 2: GRPO loss
 # ---------------------------------------------------------------------------
 
+
+def masked_mean(x: Tensor, mask: Tensor) -> Tensor:
+    return (x * mask).sum() / mask.sum().clamp(min=1.0)
+
+
 def grpo_loss(
     log_probs: Tensor,
+    log_probs_old: Tensor,
     log_probs_ref: Tensor,
     advantages: Tensor,
+    mask: Tensor,
     clip_eps: float = 0.2,
     kl_beta: float = 0.04,
 ) -> tuple[Tensor, dict]:
     """
-    GRPO objective (two variants — implement both):
+    GRPO objective:
 
     Variant A (clip-based, like PPO):
-      r_t = exp(log_π_θ - log_π_ref)  [importance ratio against reference]
-      L = -E[min(r_t · Â, clip(r_t, 1-ε, 1+ε) · Â)]
-
-    Variant B (KL-penalty, simpler):
-      L = -E[log_π_θ · Â] + β · KL(π_θ || π_ref)
-      KL ≈ mean(log_π_θ - log_π_ref)
+      r_t = exp(log_π_θ - log_π_old)  [importance ratio against generating]
+      KL = exp(logπ_ref − logπ_θ) − (logπ_ref − logπ_θ) − 1
+      L = -E[min(r_t · Â, clip(r_t, 1-ε, 1+ε) · Â) -  β · KL(π_θ || π_ref)]
 
     Args:
       log_probs: (B*G, T) — token log-probs from current policy (masked to output only)
+      log_probs_old: (B*G, T) — token log-probs from policy used to generate data
       log_probs_ref: (B*G, T) — token log-probs from reference policy
       advantages: (B*G,) — group-relative advantages, one per sequence
 
-    TODO: Implement both variants. Return (loss, metrics_dict).
+    Return (loss, metrics_dict).
     metrics_dict should include: clip_fraction, mean_kl, mean_advantage.
 
-    Important: average log_probs over the *output* token dimension only
-    (mask out prompt tokens — they don't affect the policy gradient).
+    Note: log_probs will be sent only for outputs
+    and PAD_ID tokens will have log_probs set to 0
     """
-    raise NotImplementedError
+    log_ratio = log_probs - log_probs_old
+    adv = advantages.unsqueeze(-1)
+
+    r_t = torch.exp(log_ratio)
+    clip_cond = ((r_t < 1 - clip_eps) | (r_t > 1 + clip_eps)).float()
+    clip_frac = masked_mean(clip_cond, mask)
+
+    kl = torch.exp(log_probs_ref - log_probs) - (log_probs_ref - log_probs) - 1
+    per_token_loss = (
+        torch.minimum(r_t * adv, torch.clip(r_t, 1 - clip_eps, 1 + clip_eps) * adv)
+        - kl_beta * kl
+    )
+    loss = -masked_mean(per_token_loss, mask)
+
+    metrics_dict = {
+        "clip_fraction": clip_frac,
+        "mean_kl": masked_mean(kl, mask),
+        "mean_advantage": advantages.mean(),
+        "loss": loss.item(),
+    }
+
+    return loss, metrics_dict
 
 
 # ---------------------------------------------------------------------------
 # Part 3: Group sampling rollout
 # ---------------------------------------------------------------------------
+
 
 class ToyLM(nn.Module):
     """GPT-like LM (same architecture as in assignment 01, minimal version)."""
@@ -141,7 +179,7 @@ class ToyLM(nn.Module):
     def __init__(self, vocab_size=VOCAB_SIZE, d_model=64, n_heads=2, n_layers=2):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, d_model, padding_idx=PAD_ID)
-        self.pos_embed = nn.Embedding(MAX_LEN + 4, d_model)
+        self.pos_embed = nn.Embedding(MAX_LEN + 4, d_model)  # Why + 4?
         encoder_layer = nn.TransformerEncoderLayer(
             d_model, n_heads, dim_feedforward=128, batch_first=True, norm_first=True
         )
@@ -163,8 +201,9 @@ class ToyLM(nn.Module):
         return self.head(x)
 
     @torch.no_grad()
-    def generate_group(self, prompt: Tensor, G: int, max_new: int = MAX_LEN,
-                       temperature: float = 1.0) -> tuple[Tensor, Tensor]:
+    def generate_group(
+        self, prompt: Tensor, G: int, max_new: int = MAX_LEN, temperature: float = 1.0
+    ) -> tuple[Tensor, Tensor]:
         """
         Sample G completions for a single prompt (expand to batch of G).
         Return (token_ids, log_probs) both of shape (G, max_new).
@@ -172,7 +211,36 @@ class ToyLM(nn.Module):
         TODO: Implement. Store per-token log-probs for the generated tokens only.
         These are needed for the GRPO loss.
         """
-        raise NotImplementedError
+        if prompt.dim() == 1:
+            prompt = prompt.unsqueeze(0)
+        prompt = prompt.repeat(G, 1)
+        # which rollout has finished generation
+        finished = torch.zeros((G, 1), device=prompt.device, dtype=torch.bool)
+        out_tokens = []
+        out_log_probs = []
+        for _ in range(max_new):
+            logits = self(prompt)[:, -1, :]  # predict just the last one
+            log_probs = torch.log_softmax(logits / temperature, dim=-1)
+            tokens = torch.multinomial(torch.exp(log_probs), num_samples=1)
+            # default to PAD_ID if sequence already had a EOS
+            tokens = torch.where(
+                finished,
+                torch.full_like(tokens, PAD_ID),
+                tokens,
+            )
+            lp = torch.gather(log_probs, -1, tokens)
+
+            lp = torch.where(
+                finished,
+                torch.zeros_like(lp),
+                lp,
+            )
+
+            out_log_probs.append(lp)
+            out_tokens.append(tokens)
+            finished = finished | (tokens == EOS_ID)
+            prompt = torch.cat([prompt, tokens], dim=1)
+        return torch.cat(out_tokens, dim=1), torch.cat(out_log_probs, dim=1)
 
     def log_probs_for_tokens(self, tokens: Tensor, generated_start: int) -> Tensor:
         """
@@ -181,12 +249,21 @@ class ToyLM(nn.Module):
 
         TODO: Implement. Used to recompute log_probs for the current θ during update.
         """
-        raise NotImplementedError
+        logits = self(tokens)[:, :-1, :]  # skip the last one
+        log_probs = torch.log_softmax(logits, dim=-1)
+        log_prob_chosen = torch.gather(
+            log_probs, -1, tokens[:, 1:].unsqueeze(-1)
+        ).squeeze(-1)
+        return log_prob_chosen[
+            :, generated_start - 1 :
+        ]  # we already skipped the first token
 
 
 def collect_group_rollouts(
-    policy: ToyLM, ref_policy: ToyLM,
-    prompts: list[Tensor], G: int,
+    policy: ToyLM,
+    ref_policy: ToyLM,
+    prompts: list[Tensor],
+    G: int,
     reward_fns: list,
 ) -> dict:
     """
@@ -205,15 +282,53 @@ def collect_group_rollouts(
       log_probs_ref: (B*G, T_generated)
       advantages: (B*G,)
       rewards: (B*G,)
+      mask: (B*G, T_generated)  mask indicating which tokens are padding
 
     TODO: Implement. The batching here is the engineering challenge of GRPO at scale.
     """
-    raise NotImplementedError
+    prompt_len = prompts[0].shape[-1]
+    max_new = MAX_LEN - prompt_len
+    assert all(prompt.shape[-1] == prompt_len for prompt in prompts)
+    groups = [
+        torch.cat(
+            [prompt.repeat(G, 1), policy.generate_group(prompt, G, max_new)[0]], dim=1
+        )
+        for prompt in prompts
+    ]
+    log_probs_old = [policy.log_probs_for_tokens(group, prompt_len) for group in groups]
+    log_probs_ref = [
+        ref_policy.log_probs_for_tokens(group, prompt_len) for group in groups
+    ]
+
+    rewards = torch.tensor(
+        [
+            [
+                sum([reward_fn(seq.tolist()) for reward_fn in reward_fns])
+                for seq in group
+            ]
+            for group in groups
+        ],
+        device=get_device(),
+    )
+    advantages = group_relative_advantage_batched(rewards).to(device=get_device())
+    all_tokens = torch.cat(groups, dim=0)
+
+    ret_dict = {
+        "all_tokens": all_tokens,
+        "prompt_len": prompt_len,
+        "log_probs_old": torch.cat(log_probs_old, dim=0),
+        "log_probs_ref": torch.cat(log_probs_ref, dim=0),
+        "advantages": advantages.flatten(),
+        "rewards": rewards.flatten(),
+        "mask": (all_tokens[:, prompt_len:] != PAD_ID).float(),
+    }
+    return ret_dict
 
 
 # ---------------------------------------------------------------------------
 # Part 4: Full GRPO training loop
 # ---------------------------------------------------------------------------
+
 
 def grpo_train(
     n_steps: int = 1000,
@@ -226,7 +341,12 @@ def grpo_train(
     """
     Full GRPO training. Track: mean_reward, mean_kl, clip_fraction, accuracy.
 
-    Prompts: random BOS tokens (the model learns to generate valid equations from scratch).
+    Prompts: just the BOS token — there is no varying prompt; every group starts
+    from `<BOS>` and the model generates the entire equation from scratch.
+    Note: with a randomly-initialized policy, the correctness reward is extremely
+    sparse (a fresh model almost never emits a valid equation, so all rewards in a
+    group are 0 → all advantages are 0 → no gradient). Include `format_reward` in
+    `reward_fns` to give a denser shaping signal so learning can get off the ground.
 
     TODO:
       1. Initialize policy and reference policy (same weights).
@@ -235,6 +355,12 @@ def grpo_train(
       4. Log metrics every 50 steps.
       5. Return list of log dicts.
     """
+
+    device = get_device()
+    policy = ToyLM().to(device=device)
+    ref_policy = ToyLM().to(device=device)
+    policy.load_state_dict(ref_policy.state_dict())
+
     raise NotImplementedError
 
 
@@ -242,14 +368,22 @@ def grpo_train(
 # Part 5: Comparison — GRPO vs REINFORCE-with-baseline vs PPO
 # ---------------------------------------------------------------------------
 
+
 def reinforce_with_baseline(
-    policy: ToyLM, optimizer: optim.Optimizer,
+    policy: ToyLM,
+    optimizer: optim.Optimizer,
     n_rollouts: int = 64,
 ) -> dict:
     """
     REINFORCE with a running mean baseline:
       L = -E[(r - b) · log π(a|s)]
       b ← 0.99 b + 0.01 mean(r)   [exponential moving average]
+
+    Note: the baseline b is *stateful* — it must persist across calls for the EMA
+    to mean anything. A local `b = 0` reset on every step defeats the purpose.
+    Thread it through (e.g. a `baseline` arg returned in the dict) or store it as a
+    function/module attribute. For the "without baseline" variant in
+    compare_algorithms, fix b = 0 (pure Monte-Carlo return).
 
     TODO: Implement. This is the simplest policy gradient method —
     compare its variance to GRPO's group-relative normalization.
@@ -280,11 +414,16 @@ def compare_algorithms():
 # Part 6: Ablation — group size G
 # ---------------------------------------------------------------------------
 
+
 def group_size_ablation(G_values: list[int] = [1, 2, 4, 8, 16]):
     """
     Train GRPO with different group sizes G.
-    G=1: equivalent to REINFORCE (no group normalization possible, std=0).
-    G=∞: oracle (estimates true advantage via large sample).
+    G=1: degenerate — with a single sample the group mean equals r_i, so every
+         advantage is exactly 0 and the policy never updates. This is NOT
+         REINFORCE (which uses the raw return r_i); it demonstrates why GRPO needs
+         G >= 2 for the group-relative baseline to carry any signal.
+    G large: the group estimate of mean/std converges, so the advantage approaches
+         the true (oracle) advantage — at the cost of G× more rollouts per step.
 
     TODO:
       1. Train for 300 steps with each G.
