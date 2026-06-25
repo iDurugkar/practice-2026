@@ -70,7 +70,17 @@ def format_reward(tokens: list[int]) -> float:
         for t in tokens
         if t not in (BOS_ID, EOS_ID, PAD_ID)
     )
-    return float("=" in text and any(op in text for op in ["+", "-", "*"]))
+    if "=" not in text:
+        return 0.0
+    else:
+        sections = text.split("=")
+        if len(sections) > 2:
+            return 0.1
+        if any(op in sections[1] for op in ["+", "-", "*"]):
+            return 0.2
+        if not any(op in sections[0] for op in ["+", "-", "*"]):
+            return 0.2
+        return 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +147,7 @@ def grpo_loss(
       log_probs_old: (B*G, T) — token log-probs from policy used to generate data
       log_probs_ref: (B*G, T) — token log-probs from reference policy
       advantages: (B*G,) — group-relative advantages, one per sequence
+      mask: (B*G, T) -- masking PAD tokens so they aren't used for backprop
 
     Return (loss, metrics_dict).
     metrics_dict should include: clip_fraction, mean_kl, mean_advantage.
@@ -151,6 +162,7 @@ def grpo_loss(
     clip_cond = ((r_t < 1 - clip_eps) | (r_t > 1 + clip_eps)).float()
     clip_frac = masked_mean(clip_cond, mask)
 
+    # http://joschu.net/blog/kl-approx.html
     kl = torch.exp(log_probs_ref - log_probs) - (log_probs_ref - log_probs) - 1
     per_token_loss = (
         torch.minimum(r_t * adv, torch.clip(r_t, 1 - clip_eps, 1 + clip_eps) * adv)
@@ -211,14 +223,17 @@ class ToyLM(nn.Module):
         TODO: Implement. Store per-token log-probs for the generated tokens only.
         These are needed for the GRPO loss.
         """
+        # if we got a single prompt, add a batch dimension
         if prompt.dim() == 1:
             prompt = prompt.unsqueeze(0)
+        # repeat prompt G times
         prompt = prompt.repeat(G, 1)
         # which rollout has finished generation
         finished = torch.zeros((G, 1), device=prompt.device, dtype=torch.bool)
         out_tokens = []
         out_log_probs = []
         for _ in range(max_new):
+            # check if output of self.forward is of shape (B*G, T, V)
             logits = self(prompt)[:, -1, :]  # predict just the last one
             log_probs = torch.log_softmax(logits / temperature, dim=-1)
             tokens = torch.multinomial(torch.exp(log_probs), num_samples=1)
@@ -230,6 +245,7 @@ class ToyLM(nn.Module):
             )
             lp = torch.gather(log_probs, -1, tokens)
 
+            # if we are using masking do we need this?
             lp = torch.where(
                 finished,
                 torch.zeros_like(lp),
@@ -300,6 +316,7 @@ def collect_group_rollouts(
         ref_policy.log_probs_for_tokens(group, prompt_len) for group in groups
     ]
 
+    # ToDo: try and vectorize this operation
     rewards = torch.tensor(
         [
             [
@@ -360,8 +377,45 @@ def grpo_train(
     policy = ToyLM().to(device=device)
     ref_policy = ToyLM().to(device=device)
     policy.load_state_dict(ref_policy.state_dict())
+    optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
 
-    raise NotImplementedError
+    batch_size = n_prompts_per_step
+    group_size = G
+    prompts = [torch.tensor([[BOS_ID]], device=device, dtype=torch.long)] * batch_size
+    logs = []
+    reward_fns = [expression_reward, format_reward]
+
+    for step in range(n_steps):
+        optimizer.zero_grad()
+        group_dict = collect_group_rollouts(
+            policy, ref_policy, prompts, group_size, reward_fns
+        )
+        loss, metrics = grpo_loss(
+            group_dict["log_probs_old"],
+            group_dict["log_probs_old"],
+            group_dict["log_probs_ref"],
+            group_dict["advantages"],
+            group_dict["mask"],
+            clip_eps,
+            kl_beta,
+        )
+        loss.backward()
+        optimizer.step()
+        if (step + 1) % 50 == 0:
+            text = "".join(
+                VOCAB[t] if t < len(VOCAB) else ""
+                for t in group_dict["all_tokens"][0].tolist()
+                if t not in (BOS_ID, EOS_ID, PAD_ID)
+            )
+            print(f"{step=}")
+            print(f"average_rewards: {torch.mean(group_dict['rewards'])}")
+            print(f"mean_KL: {metrics['mean_kl']}")
+            print(f"clip_fraction: {metrics['clip_fraction']}")
+            print(f"example rollout: {text}")
+            print("==============================")
+            logs.append(metrics)
+
+    return logs
 
 
 # ---------------------------------------------------------------------------
@@ -369,11 +423,103 @@ def grpo_train(
 # ---------------------------------------------------------------------------
 
 
-def reinforce_with_baseline(
+def reinforce_loss(
+    log_probs: Tensor,
+    advantages: Tensor,
+    mask: Tensor,
+) -> tuple[Tensor, dict]:
+    """
+
+    Args:
+      log_probs: (B, T) — token log-probs from current policy (masked to output only)
+      advantages: (B,) — reinforce advantages, one per sequence
+      mask: (B, T) -- masking PAD tokens so they aren't used for backprop
+
+    Return (loss, metrics_dict).
+    metrics_dict should include: clip_fraction, mean_kl, mean_advantage.
+
+    Note: log_probs will be sent only for outputs
+    and PAD_ID tokens will have log_probs set to 0
+    """
+
+    per_token_loss = advantages.unsqueeze(-1) * log_probs
+    loss = -masked_mean(per_token_loss, mask)
+
+    metrics_dict = {
+        "mean_advantage": advantages.mean(),
+        "loss": loss.item(),
+    }
+
+    return loss, metrics_dict
+
+
+def collect_reinforce_rollouts(
     policy: ToyLM,
-    optimizer: optim.Optimizer,
-    n_rollouts: int = 64,
+    prompts: list[Tensor],
+    reward_fns: list,
+    baseline: float = 0.0,
+    ema_weight: float = 0.01,
 ) -> dict:
+    """
+    For each prompt, generate G completions and score with all reward_fns.
+    Compute group-relative advantages per reward function, then combine.
+
+    Args:
+      prompts: list of prompt tensors (each shape (1, T_prompt))
+      reward_fns: list of callable(tokens) → float  [can combine multiple rewards]
+      baseline: that should be subtracted from rewards to get advantages
+      ema_weight: used to adjust the baseline for the next step
+
+    Return dict with:
+      all_tokens: (B, T)
+      prompt_len: int
+      log_probs: (B, T_generated)
+      advantages: (B,)
+      rewards: (B,)
+      mask: (B, T_generated)  mask indicating which tokens are padding
+      baseline: float
+    """
+    prompt_len = prompts[0].shape[-1]
+    max_new = MAX_LEN - prompt_len
+    assert all(prompt.shape[-1] == prompt_len for prompt in prompts)
+    rollouts = [
+        torch.cat([prompt, policy.generate_group(prompt, 1, max_new)[0]], dim=1)
+        for prompt in prompts
+    ]
+
+    log_probs = [policy.log_probs_for_tokens(ro, prompt_len) for ro in rollouts]
+
+    # ToDo: try and vectorize this operation
+    rewards = torch.tensor(
+        [
+            sum([reward_fn(ro[0].tolist()) for reward_fn in reward_fns])
+            for ro in rollouts
+        ],
+        device=get_device(),
+    )
+    advantages = rewards - baseline
+    all_tokens = torch.cat(rollouts, dim=0)
+    baseline = (1 - ema_weight) * baseline + ema_weight * rewards.mean().item()
+
+    ret_dict = {
+        "all_tokens": all_tokens,
+        "prompt_len": prompt_len,
+        "log_probs": torch.cat(log_probs, dim=0),
+        "advantages": advantages.flatten(),
+        "rewards": rewards.flatten(),
+        "mask": (all_tokens[:, prompt_len:] != PAD_ID).float(),
+        "baseline": baseline,
+    }
+    return ret_dict
+
+
+def reinforce_with_baseline(
+    n_steps: int = 1000,
+    n_prompts_per_step: int = 8,
+    lr: float = 5e-5,
+    ema_weight: float = 0.01,
+    use_baseline: bool = True,
+) -> list[dict]:
     """
     REINFORCE with a running mean baseline:
       L = -E[(r - b) · log π(a|s)]
@@ -388,7 +534,42 @@ def reinforce_with_baseline(
     TODO: Implement. This is the simplest policy gradient method —
     compare its variance to GRPO's group-relative normalization.
     """
-    raise NotImplementedError
+    device = get_device()
+    policy = ToyLM().to(device=device)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
+
+    batch_size = n_prompts_per_step
+    prompts = [torch.tensor([[BOS_ID]], device=device, dtype=torch.long)] * batch_size
+    logs = []
+    reward_fns = [expression_reward, format_reward]
+    baseline = 0.0
+
+    for step in range(n_steps):
+        optimizer.zero_grad()
+        group_dict = collect_reinforce_rollouts(
+            policy, prompts, reward_fns, baseline if use_baseline else 0.0, ema_weight
+        )
+        baseline = group_dict["baseline"]
+        loss, metrics = reinforce_loss(
+            group_dict["log_probs"],
+            group_dict["advantages"],
+            group_dict["mask"],
+        )
+        loss.backward()
+        optimizer.step()
+        if (step + 1) % 50 == 0:
+            text = "".join(
+                VOCAB[t] if t < len(VOCAB) else ""
+                for t in group_dict["all_tokens"][0].tolist()
+                if t not in (BOS_ID, EOS_ID, PAD_ID)
+            )
+            print(f"{step=}")
+            print(f"average_rewards: {torch.mean(group_dict['rewards'])}")
+            print(f"example rollout: {text}")
+            print("==============================")
+            logs.append(metrics)
+
+    return logs
 
 
 def compare_algorithms():
@@ -437,8 +618,14 @@ if __name__ == "__main__":
     print("=== GRPO Training ===")
     logs = grpo_train(n_steps=500, G=8)
 
-    print("\n=== Algorithm Comparison ===")
-    compare_algorithms()
+    print("=== REINFORCE Training ===")
+    logs = reinforce_with_baseline(
+        n_steps=500,
+        n_prompts_per_step=64,
+    )
 
-    print("\n=== Group Size Ablation ===")
-    group_size_ablation()
+    # print("\n=== Algorithm Comparison ===")
+    # compare_algorithms()
+
+    # print("\n=== Group Size Ablation ===")
+    # group_size_ablation()
