@@ -19,13 +19,15 @@ Refs:
 Setup: pip install torch numpy matplotlib   (all in the lean env)
 """
 
-import torch
 import matplotlib.pyplot as plt
+import torch
+from pandas.io.sql import table_exists
 from torch import Tensor
 
 # ---------------------------------------------------------------------------
 # Part 1: Broadcasting & einsum — vectorize without loops
 # ---------------------------------------------------------------------------
+
 
 def pairwise_sq_distances(X: Tensor, Y: Tensor) -> Tensor:
     """
@@ -37,7 +39,10 @@ def pairwise_sq_distances(X: Tensor, Y: Tensor) -> Tensor:
         ||x - y||^2 = ||x||^2 - 2 x·y + ||y||^2
     i.e. row norms broadcast against a (n, m) inner-product matrix (X @ Y.T).
     """
-    raise NotImplementedError
+    x_sq = torch.einsum("ik, ik -> i", X, X)
+    y_sq = torch.einsum("jk, jk -> j", Y, Y)
+    cross = torch.einsum("ik, jk -> ij", X, Y)
+    return x_sq[:, None] - 2 * cross + y_sq[None, :]
 
 
 def batched_bilinear(x: Tensor, A: Tensor, y: Tensor) -> Tensor:
@@ -48,7 +53,7 @@ def batched_bilinear(x: Tensor, A: Tensor, y: Tensor) -> Tensor:
     TODO: Implement with a single torch.einsum call (no loop, no intermediate
     stacking). Figure out the right subscript string for "bp,bpq,bq->b".
     """
-    raise NotImplementedError
+    return torch.einsum("bp, bpq, bq -> b", x, A, y)
 
 
 def _reference_bilinear(x: Tensor, A: Tensor, y: Tensor) -> Tensor:
@@ -62,13 +67,16 @@ def _reference_bilinear(x: Tensor, A: Tensor, y: Tensor) -> Tensor:
 # Compute dL/dW, dL/db, dL/dx analytically and check against autograd + finite
 # differences.
 
+
 def linear_mse_forward(x: Tensor, W: Tensor, b: Tensor, t: Tensor) -> Tensor:
     """Forward pass returning the scalar MSE loss. (Provided.)"""
     y = x @ W.T + b
     return ((y - t) ** 2).mean()
 
 
-def linear_mse_backward(x: Tensor, W: Tensor, b: Tensor, t: Tensor):
+def linear_mse_backward(
+    x: Tensor, W: Tensor, b: Tensor, t: Tensor
+) -> tuple[Tensor, Tensor, Tensor]:
     """
     Analytic gradients of linear_mse_forward w.r.t. W, b, x.
     Shapes: x (n, d_in), W (d_out, d_in), b (d_out,), t (n, d_out).
@@ -80,13 +88,20 @@ def linear_mse_backward(x: Tensor, W: Tensor, b: Tensor, t: Tensor):
         db = g.sum(dim=0)                    # (d_out,)
         dx = g @ W                           # (n, d_in)
     """
-    raise NotImplementedError
+    y = x @ W.T + b[None, :]
+    err = y - t
+    g = (2 / (err.shape[0] * err.shape[1])) * err  # (n, d_out)
+
+    dW = g.T @ x  # (d_out, d_in)
+    dx = g @ W  # (n, d_in)
+    db = torch.einsum("ij -> j", g)  # (d_out,)
+    return dW, db, dx
 
 
 def finite_difference_grad(f, x: Tensor, eps: float = 1e-4) -> Tensor:
     """Central-difference gradient of scalar f at x. (Provided, for checking.)"""
     grad = torch.zeros_like(x)
-    flat, g = x.reshape(-1), grad.reshape(-1)
+    flat, g = x.reshape(-1), grad.reshape(-1)  # is this a view?
     for i in range(flat.numel()):
         orig = flat[i].item()
         flat[i] = orig + eps
@@ -102,6 +117,7 @@ def finite_difference_grad(f, x: Tensor, eps: float = 1e-4) -> Tensor:
 # Part 3: A training loop from scratch (no autograd)
 # ---------------------------------------------------------------------------
 
+
 def train_linear_regression(x: Tensor, t: Tensor, lr: float = 0.1, steps: int = 200):
     """
     Fit y = x @ W.T + b to targets t with plain SGD, using your analytic
@@ -112,7 +128,16 @@ def train_linear_regression(x: Tensor, t: Tensor, lr: float = 0.1, steps: int = 
       - Each step: loss = linear_mse_forward(...); (dW, db, _) = backward(...);
         update W and b in-place (W -= lr * dW, b -= lr * db); append loss.item().
     """
-    raise NotImplementedError
+    W = torch.zeros((t.shape[1], x.shape[1]))
+    b = torch.zeros((t.shape[1],))
+    losses = []
+    for _ in range(steps):
+        loss = linear_mse_forward(x, W, b, t)
+        dW, db, _ = linear_mse_backward(x, W, b, t)
+        W -= lr * dW
+        b -= lr * db
+        losses.append(loss.item())
+    return W, b, losses
 
 
 if __name__ == "__main__":
@@ -121,10 +146,16 @@ if __name__ == "__main__":
     # Part 1 checks
     X, Y = torch.randn(5, 3), torch.randn(4, 3)
     D_ref = ((X[:, None, :] - Y[None, :, :]) ** 2).sum(-1)
-    print("pairwise dist max err:", (pairwise_sq_distances(X, Y) - D_ref).abs().max().item())
+    print(
+        "pairwise dist max err:",
+        (pairwise_sq_distances(X, Y) - D_ref).abs().max().item(),
+    )
 
     x, A, y = torch.randn(8, 3), torch.randn(8, 3, 4), torch.randn(8, 4)
-    print("bilinear max err:", (batched_bilinear(x, A, y) - _reference_bilinear(x, A, y)).abs().max().item())
+    print(
+        "bilinear max err:",
+        (batched_bilinear(x, A, y) - _reference_bilinear(x, A, y)).abs().max().item(),
+    )
 
     # Part 2: analytic vs autograd vs finite-difference (use double for accuracy)
     n, d_in, d_out = 6, 4, 3
@@ -137,7 +168,9 @@ if __name__ == "__main__":
     dW, db, dx = linear_mse_backward(x, W, b, t)
     print("dW err vs autograd:", (dW - W.grad).abs().max().item())
     print("db err vs autograd:", (db - b.grad).abs().max().item())
-    fdx = finite_difference_grad(lambda xx: linear_mse_forward(xx, W.detach(), b.detach(), t), x.clone())
+    fdx = finite_difference_grad(
+        lambda xx: linear_mse_forward(xx, W.detach(), b.detach(), t), x.clone()
+    )
     print("dx err vs finite-diff:", (dx - fdx).abs().max().item())
 
     # Part 3: training
@@ -145,6 +178,10 @@ if __name__ == "__main__":
     xs = torch.randn(256, 4)
     ts = xs @ Wtrue.T + 0.05 * torch.randn(256, 2)
     W, b, hist = train_linear_regression(xs, ts)
-    plt.plot(hist); plt.yscale("log"); plt.xlabel("step"); plt.ylabel("MSE")
-    plt.title("From-scratch linear regression"); plt.savefig("tensor_training.png", dpi=120)
+    plt.plot(hist)
+    plt.yscale("log")
+    plt.xlabel("step")
+    plt.ylabel("MSE")
+    plt.title("From-scratch linear regression")
+    plt.savefig("tensor_training.png", dpi=120)
     print(f"final loss: {hist[-1]:.4e}")

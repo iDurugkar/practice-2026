@@ -20,6 +20,7 @@ Refs:
 Setup: pip install torch   (in the lean env)
 """
 
+import matplotlib.pyplot as plt
 import torch
 from torch import Tensor
 from torch.autograd import Function
@@ -27,6 +28,7 @@ from torch.autograd import Function
 # ---------------------------------------------------------------------------
 # Part 1: A numerically stable LogSumExp Function
 # ---------------------------------------------------------------------------
+
 
 class LogSumExp(Function):
     """
@@ -43,13 +45,20 @@ class LogSumExp(Function):
         #   out = z.sum(-1, keepdim=True).log() + m      # then squeeze last dim
         #   ctx.save_for_backward(z / z.sum(-1, keepdim=True))   # = softmax(x)
         #   return out.squeeze(-1)                       # shape x.shape[:-1]
-        raise NotImplementedError
+        m = x.max(dim=-1, keepdim=True).values
+        z = (x - m).exp()
+        out = z.sum(-1, keepdim=True).log() + m
+        ctx.save_for_backward(z / z.sum(-1, keepdim=True))  # softmax
+        return out.squeeze(-1)
 
     @staticmethod
-    def backward(ctx, grad_out: Tensor):
+    def backward(ctx, grad_output: Tensor):
         # TODO: d/dx logsumexp(x) = softmax(x). grad_out has shape x.shape[:-1];
         # unsqueeze its last dim and multiply by the saved softmax.
-        raise NotImplementedError
+        softmax = ctx.saved_tensors[0]
+        # print(softmax.shape, ctx.saved_tensors)
+        dx = grad_output.unsqueeze(-1) * softmax
+        return dx
 
 
 def logsumexp(x: Tensor) -> Tensor:
@@ -59,6 +68,7 @@ def logsumexp(x: Tensor) -> Tensor:
 # ---------------------------------------------------------------------------
 # Part 2: Straight-Through Estimator
 # ---------------------------------------------------------------------------
+
 
 class RoundSTE(Function):
     """
@@ -70,12 +80,12 @@ class RoundSTE(Function):
     @staticmethod
     def forward(ctx, x: Tensor) -> Tensor:
         # TODO: return torch.round(x). Nothing needs to be saved.
-        raise NotImplementedError
+        return torch.round(x)
 
     @staticmethod
     def backward(ctx, grad_out: Tensor):
         # TODO: identity backward — return grad_out unchanged.
-        raise NotImplementedError
+        return grad_out
 
 
 def round_ste(x: Tensor) -> Tensor:
@@ -85,6 +95,7 @@ def round_ste(x: Tensor) -> Tensor:
 # ---------------------------------------------------------------------------
 # Part 3: Train through a non-differentiable quantizer with the STE
 # ---------------------------------------------------------------------------
+
 
 def fit_with_quantizer(steps: int = 300, lr: float = 0.05):
     """
@@ -98,7 +109,16 @@ def fit_with_quantizer(steps: int = 300, lr: float = 0.05):
       - loop: opt.zero_grad(); loss = (round_ste(w) - 3.0).pow(2).mean();
         loss.backward(); opt.step(); record loss.item().
     """
-    raise NotImplementedError
+    w = torch.zeros(1, requires_grad=True)
+    opt = torch.optim.SGD([w], lr=lr)
+    losses = []
+    for _ in range(steps):
+        opt.zero_grad()
+        loss = (round_ste(w) - 3.0).pow(2).mean()
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
 
 
 if __name__ == "__main__":
@@ -106,7 +126,10 @@ if __name__ == "__main__":
 
     # Part 1: verify LogSumExp against torch and with gradcheck.
     x = torch.randn(4, 7, dtype=torch.double, requires_grad=True)
-    print("logsumexp max err vs torch:", (logsumexp(x) - torch.logsumexp(x, dim=-1)).abs().max().item())
+    print(
+        "logsumexp max err vs torch:",
+        (logsumexp(x) - torch.logsumexp(x, dim=-1)).abs().max().item(),
+    )
     print("gradcheck LogSumExp:", torch.autograd.gradcheck(logsumexp, (x,)))
 
     # Part 2: STE forward rounds, backward is identity (ones).
@@ -117,3 +140,8 @@ if __name__ == "__main__":
     # Part 3: training through the quantizer.
     hist = fit_with_quantizer()
     print(f"quantizer training final loss: {hist[-1]:.4f} (expect ~0)")
+    plt.plot(hist)
+    plt.xlabel("steps")
+    plt.ylabel("loss")
+    plt.savefig("autograd_testing.png")
+    plt.cla()
