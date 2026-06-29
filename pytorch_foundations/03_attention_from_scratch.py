@@ -20,6 +20,7 @@ Setup: pip install torch   (in the lean env)
 """
 
 import math
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -27,6 +28,7 @@ from torch import Tensor
 # ---------------------------------------------------------------------------
 # Part 1: Numerically stable softmax
 # ---------------------------------------------------------------------------
+
 
 def stable_softmax(scores: Tensor, dim: int = -1) -> Tensor:
     """
@@ -36,12 +38,15 @@ def stable_softmax(scores: Tensor, dim: int = -1) -> Tensor:
     divide by the sum along `dim`. (Subtracting a constant per row leaves the
     softmax unchanged but keeps exp() in range.)
     """
-    raise NotImplementedError
+    shifted_scores = scores - scores.max(dim, keepdim=True).values
+    exps = shifted_scores.exp()
+    return exps / exps.sum(dim, keepdim=True)
 
 
 # ---------------------------------------------------------------------------
 # Part 2: Scaled dot-product attention
 # ---------------------------------------------------------------------------
+
 
 def sdpa(q: Tensor, k: Tensor, v: Tensor, causal: bool = False) -> Tensor:
     """
@@ -54,15 +59,26 @@ def sdpa(q: Tensor, k: Tensor, v: Tensor, causal: bool = False) -> Tensor:
     (L, L) upper-triangular mask via torch.triu(torch.ones(L, L, bool), diagonal=1)
     and scores.masked_fill(mask, float('-inf')).
     """
-    raise NotImplementedError
+    d = k.shape[-1]
+    L = k.shape[-2]
+    scores = q @ k.transpose(-2, -1) / math.sqrt(d)
+    if causal:
+        mask = torch.triu(
+            torch.ones(L, L, device=q.device, dtype=torch.bool), diagonal=1
+        )
+        scores = scores.masked_fill(mask, float("-inf"))
+    out = stable_softmax(scores) @ v
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Part 3: Multi-head attention
 # ---------------------------------------------------------------------------
 
-def multihead_attention(x: Tensor, Wqkv: Tensor, Wo: Tensor, n_heads: int,
-                        causal: bool = False) -> Tensor:
+
+def multihead_attention(
+    x: Tensor, Wqkv: Tensor, Wo: Tensor, n_heads: int, causal: bool = False
+) -> Tensor:
     """
     x: (B, L, D). Wqkv: (D, 3D) projects to concatenated q, k, v. Wo: (D, D).
     Split into n_heads of size d = D // n_heads, run sdpa per head, concat, project.
@@ -74,14 +90,28 @@ def multihead_attention(x: Tensor, Wqkv: Tensor, Wo: Tensor, n_heads: int,
       - out = sdpa(q, k, v, causal)              # (B, n_heads, L, d)
       - merge heads back to (B, L, D) (transpose back, reshape), then @ Wo
     """
-    raise NotImplementedError
+    assert len(x.shape) == 3
+    B, L, D = x.shape
+    qkv = x @ Wqkv
+    q, k, v = qkv[..., :D], qkv[..., D : 2 * D], qkv[..., -D:]
+    q = q.reshape([*q.shape[:-1], n_heads, D // n_heads]).transpose(1, 2)
+    k = k.reshape([*k.shape[:-1], n_heads, D // n_heads]).transpose(1, 2)
+    v = v.reshape([*v.shape[:-1], n_heads, D // n_heads]).transpose(1, 2)
+
+    out = sdpa(q, k, v, causal=causal)
+    out = out.transpose(1, 2)
+    out = out.reshape([*out.shape[:-2], D])
+    return out @ Wo
 
 
 # ---------------------------------------------------------------------------
 # Part 4 (advanced): Online softmax attention in a single streaming pass
 # ---------------------------------------------------------------------------
 
-def online_softmax_attention(q: Tensor, k: Tensor, v: Tensor, block: int = 16) -> Tensor:
+
+def online_softmax_attention(
+    q: Tensor, k: Tensor, v: Tensor, block: int = 16
+) -> Tensor:
     """
     Compute (non-causal) attention output WITHOUT ever materializing the full
     (L, L) score matrix, by streaming over key/value blocks while keeping a
@@ -102,7 +132,19 @@ def online_softmax_attention(q: Tensor, k: Tensor, v: Tensor, block: int = 16) -
     TODO: implement the recurrence above (iterate with k.split(block) and
     v.split(block)).
     """
-    raise NotImplementedError
+    L, d = q.shape
+    m = torch.full((L,), float("-inf"))
+    l = torch.zeros_like(m)
+    acc = torch.zeros((L, d))
+    for Kb, Vb in zip(k.split(block), v.split(block)):
+        s = q @ Kb.transpose(-2, -1) / math.sqrt(d)
+        m_new = torch.maximum(m, s.max(dim=-1).values)
+        corr = (m - m_new).exp()
+        p = (s - m_new[:, None]).exp()
+        l = l * corr + p.sum(dim=-1)
+        acc = acc * corr[:, None] + p @ Vb
+        m = m_new
+    return acc / l[:, None]
 
 
 if __name__ == "__main__":
@@ -110,13 +152,21 @@ if __name__ == "__main__":
 
     # Part 1: stable even with huge scores.
     s = torch.randn(3, 5) * 50
-    print("softmax max err vs torch:", (stable_softmax(s) - torch.softmax(s, -1)).abs().max().item())
+    print(
+        "softmax max err vs torch:",
+        (stable_softmax(s) - torch.softmax(s, -1)).abs().max().item(),
+    )
 
     # Part 2: check against torch's fused SDPA (its default scale is 1/sqrt(d)).
     q, k, v = (torch.randn(2, 7, 8) for _ in range(3))
-    print("sdpa max err:", (sdpa(q, k, v) - F.scaled_dot_product_attention(q, k, v)).abs().max().item())
+    print(
+        "sdpa max err:",
+        (sdpa(q, k, v) - F.scaled_dot_product_attention(q, k, v)).abs().max().item(),
+    )
     ref_c = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-    print("causal sdpa max err:", (sdpa(q, k, v, causal=True) - ref_c).abs().max().item())
+    print(
+        "causal sdpa max err:", (sdpa(q, k, v, causal=True) - ref_c).abs().max().item()
+    )
 
     # Part 3: multi-head — check output shape.
     B, L, D, H = 2, 6, 16, 4
@@ -128,4 +178,7 @@ if __name__ == "__main__":
     # Part 4: online softmax must match the dense result.
     q1, k1, v1 = (torch.randn(20, 8) for _ in range(3))
     dense = sdpa(q1, k1, v1)
-    print("online vs dense max err:", (online_softmax_attention(q1, k1, v1, block=6) - dense).abs().max().item())
+    print(
+        "online vs dense max err:",
+        (online_softmax_attention(q1, k1, v1, block=6) - dense).abs().max().item(),
+    )
