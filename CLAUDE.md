@@ -8,8 +8,8 @@ A personal study sandbox for practicing ML, GenAI, and RL by implementing
 research-level concepts from scratch. It is **not** a library or application —
 there is no package to build and nothing imports across the topic directories.
 
-Each `.py` file under `pytorch_foundations/`, `generative_ai/`, and
-`reinforcement_learning/` is a
+Each `.py` file under `pytorch_foundations/`, `ml_fundamentals/`,
+`generative_ai/`, and `reinforcement_learning/` is a
 **self-contained assignment**: a guided skeleton with theory, paper references,
 and deliberately unimplemented stubs (`raise NotImplementedError`) that the user
 fills in. The numeric prefixes (`01_`, `02_`) indicate intended order within a

@@ -18,6 +18,7 @@ Setup: pip install anthropic && export ANTHROPIC_API_KEY=...
 """
 
 import json
+
 import anthropic
 
 client = anthropic.Anthropic()
@@ -37,6 +38,7 @@ with diffusion-based data augmentation. On D4RL benchmarks, our method achieves
 state-of-the-art on hopper-medium-v2 (95.2) and halfcheetah-medium-v2 (79.1)
 with only 100k gradient steps, a 3x reduction over CQL baselines.
 """
+
 
 def classify_abstract_unstructured(abstract: str) -> dict | None:
     """Prompt without explicit format enforcement. Measure parse reliability."""
@@ -80,6 +82,7 @@ MOCK_CITATIONS = {
     "Decision Transformer": 3200,
 }
 
+
 def mock_tool_call(name: str, inputs: dict) -> str:
     if name == "calculator":
         return str(eval(inputs["expression"]))  # noqa: S307 — toy example
@@ -120,6 +123,7 @@ RL_QUESTIONS = [
     "In GRPO, how are the per-token advantages normalized within a group?",
 ]
 
+
 def react_answer(question: str) -> str:
     """
     TODO: Prompt with a ReAct system prompt that enforces the
@@ -133,6 +137,7 @@ def react_answer(question: str) -> str:
 # ---------------------------------------------------------------------------
 # Part 4: Reliability experiment
 # ---------------------------------------------------------------------------
+
 
 def reliability_experiment():
     """
