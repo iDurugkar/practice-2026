@@ -45,7 +45,10 @@ def pairwise_sq_distances(X: Tensor, C: Tensor) -> Tensor:
     memory.) Clamp the result at 0: floating-point cancellation can make
     tiny distances slightly negative.
     """
-    raise NotImplementedError
+    x2 = torch.einsum("ik, ik -> i", X, X)
+    xc = torch.einsum("ik, jk -> ij", X, C)
+    c2 = torch.einsum("jk, jk -> j", C, C)
+    return torch.clamp(x2[:, None] - 2 * xc + c2[None, :], min=0.0)
 
 
 def assign_clusters(X: Tensor, C: Tensor) -> Tensor:
@@ -54,7 +57,7 @@ def assign_clusters(X: Tensor, C: Tensor) -> Tensor:
 
     TODO: One line on top of pairwise_sq_distances.
     """
-    raise NotImplementedError
+    return torch.argmin(pairwise_sq_distances(X, C), dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +81,16 @@ def update_centroids(X: Tensor, z: Tensor, k: int) -> Tensor:
         centroid (a standard fix that also lowers J). Don't skip this — the
         __main__ check triggers it deliberately.
     """
-    raise NotImplementedError
+    one_hot = torch.nn.functional.one_hot(z, k)  # N, k
+    counts = one_hot.sum(0)  # k
+    sums = one_hot.T @ X  # k, d
+    C = sums / counts[:, None]
+    empty = (counts == 0).nonzero(as_tuple=True)[0]
+    if empty.sum() > 0:
+        self_dist = ((X - C[z]) ** 2).sum(-1)
+        new_idx = torch.topk(self_dist, empty.shape[0]).indices
+        C[empty] = X[new_idx]
+    return C
 
 
 def inertia(X: Tensor, C: Tensor, z: Tensor) -> float:
@@ -87,7 +99,7 @@ def inertia(X: Tensor, C: Tensor, z: Tensor) -> float:
 
     TODO: index the distance matrix (or compute residuals directly) — no loop.
     """
-    raise NotImplementedError
+    return ((X - C[z]) ** 2).sum().item()
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +126,20 @@ def kmeans_pp_init(X: Tensor, k: int, generator: torch.Generator) -> Tensor:
       - Sample indices with torch.multinomial(d2, 1, generator=generator).
       - Use `generator` for ALL randomness so runs are reproducible.
     """
-    raise NotImplementedError
+    cs = []
+    assert k > 0, "no valid centroids to return"
+    cs.append(
+        X[
+            torch.multinomial(
+                torch.ones(X.shape[0], dtype=torch.long), 1, generator=generator
+            )
+        ]
+    )
+    d2 = ((X - cs[-1][None, :]) ** 2).sum(-1)
+    for i in range(1, k):
+        cs.append(X[torch.multinomial(d2, 1, generator=generator)])
+        d2 = torch.minimum(d2, ((X - cs[-1][None, :]) ** 2).sum(-1))
+    return torch.tensor(cs)
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +183,9 @@ def kmeans(
 # you through the log-sum-exp trick.
 
 
-def gmm_e_step(X: Tensor, pi: Tensor, mu: Tensor, sigma2: Tensor) -> tuple[Tensor, float]:
+def gmm_e_step(
+    X: Tensor, pi: Tensor, mu: Tensor, sigma2: Tensor
+) -> tuple[Tensor, float]:
     """
     E-step for a spherical GMM. Shapes: X (n, d), pi (k,), mu (k, d),
     sigma2 (k,) — per-component isotropic variances.
@@ -218,7 +245,10 @@ if __name__ == "__main__":
     X = torch.randn(50, 3)
     C = torch.randn(4, 3)
     D_ref = ((X[:, None, :] - C[None, :, :]) ** 2).sum(-1)
-    print("pairwise dist max err:", (pairwise_sq_distances(X, C) - D_ref).abs().max().item())
+    print(
+        "pairwise dist max err:",
+        (pairwise_sq_distances(X, C) - D_ref).abs().max().item(),
+    )
 
     z = assign_clusters(X, C)
     assert z.shape == (50,) and z.dtype == torch.long

@@ -28,6 +28,7 @@ data/
 *.ckpt
 *.safetensors
 *.gguf
+*.png
 
 # macOS
 .DS_Store
