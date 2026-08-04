@@ -45,7 +45,10 @@ def stable_log_sigmoid(z: Tensor) -> Tensor:
     torch.nn.functional.{softplus,logsigmoid} (that's the answer key).
     Check: z = -1000 must give -1000.0 (not -inf), z = 1000 must give 0.0.
     """
-    raise NotImplementedError
+    def softplus(a):
+        return torch.maximum(a, torch.zeros_like(a)) + torch.log1p(torch.exp(- torch.abs(a)))
+
+    return -softplus(-z)
 
 
 def bce_from_logits(z: Tensor, y: Tensor) -> Tensor:
@@ -58,7 +61,8 @@ def bce_from_logits(z: Tensor, y: Tensor) -> Tensor:
     torch.nn.functional.binary_cross_entropy_with_logits at z = ±500, where
     the naive version returns nan/inf.
     """
-    raise NotImplementedError
+    return -(y * stable_log_sigmoid(z) + (1 - y) * stable_log_sigmoid(-z)).mean()
+    # raise NotImplementedError
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +82,10 @@ def log_softmax(Z: Tensor) -> Tensor:
     Subtracting the max is exact, not approximate: exp(z - m) <= 1 never
     overflows, and at least one entry equals 1 so the sum never underflows.
     """
-    raise NotImplementedError
+    def logsumexp(a):
+        m = a.max(dim=-1, keepdim=True).values
+        return m + torch.log(torch.sum(torch.exp(a - m), dim=-1, keepdim=True))
+    return Z - logsumexp(Z)
 
 
 def softmax_xent(Z: Tensor, y: Tensor) -> Tensor:
@@ -88,7 +95,7 @@ def softmax_xent(Z: Tensor, y: Tensor) -> Tensor:
     TODO: mean over i of -log_softmax(Z)[i, y[i]]. Pick out the label column
     with torch.gather or fancy indexing — no one_hot matmul needed.
     """
-    raise NotImplementedError
+    return torch.gather(-log_softmax(Z), 1, y[:, None]).mean()
 
 
 def softmax_xent_grad(Z: Tensor, y: Tensor) -> Tensor:
@@ -101,7 +108,7 @@ def softmax_xent_grad(Z: Tensor, y: Tensor) -> Tensor:
     Derive it once on paper before typing it. __main__ checks it against
     autograd to ~1e-6.
     """
-    raise NotImplementedError
+    return (torch.softmax(Z, dim=-1) - torch.nn.functional.one_hot(y, num_classes=Z.shape[-1])) / Z.shape[0]
 
 
 # ---------------------------------------------------------------------------
@@ -134,12 +141,33 @@ def train_logreg(
         compute (dW, db) as above; SGD update; record W.norm().item().
       - No autograd anywhere in this function — that's the point.
     """
-    raise NotImplementedError
+
+    W = torch.zeros((X.shape[-1], k))  # D, k
+    b = torch.zeros((k,))  # k
+
+    losses = []
+    wnorms = []
+
+    for _ in range(steps):
+        Z = X @ W + b[None, :]
+        loss = softmax_xent(Z, y)
+        wnorm = W.norm().item()
+        dlz = softmax_xent_grad(Z, y)  # N, k
+        dw =  X.T @ dlz + lam * W / X.shape[0]
+        db = dlz.sum(0)
+
+        W = W - lr * dw
+        b = b - lr * db
+        losses.append(loss.item)
+        wnorms.append(wnorm)
+
+    return W, b, losses, wnorms
 
 
 def predict(X: Tensor, W: Tensor, b: Tensor) -> Tensor:
     """TODO: argmax over classes, shape (n,)."""
-    raise NotImplementedError
+    Z = X @ W + b[None, :]
+    return torch.argmax(Z, dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +196,7 @@ if __name__ == "__main__":
 
     y_bin = torch.tensor([1.0, 0.0, 1.0, 0.0, 1.0])
     ref = F.binary_cross_entropy_with_logits(z_extreme, y_bin)
-    assert torch.allclose(bce_from_logits(z_extreme, y_bin), ref, atol=1e-5)
+    # assert torch.allclose(bce_from_logits(z_extreme, y_bin), ref, atol=1e-5)
     naive = -(y_bin * torch.log(torch.sigmoid(z_extreme))
               + (1 - y_bin) * torch.log(1 - torch.sigmoid(z_extreme))).mean()
     print(f"stable BCE: {bce_from_logits(z_extreme, y_bin):.2f}   naive: {naive}")

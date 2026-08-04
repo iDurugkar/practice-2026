@@ -58,7 +58,8 @@ def poly_features(x: Tensor, degree: int) -> Tensor:
     TODO: One expression with broadcasting — x[:, None] raised to a
     torch.arange of exponents. No loop.
     """
-    raise NotImplementedError
+    exponents = torch.arange(degree+1)
+    return x[:, None] ** exponents
 
 
 def ridge_fit(Phi: Tensor, y: Tensor, lam: float) -> Tensor:
@@ -75,7 +76,15 @@ def ridge_fit(Phi: Tensor, y: Tensor, lam: float) -> Tensor:
       - Work in float64: Phi^T Phi for degree ~10 already loses most float32
         precision.
     """
-    raise NotImplementedError
+    # Phi n, m
+    # I - m, m
+    # y = n, out_d
+    I = torch.eye(Phi.shape[-1], dtype=torch.float64)
+    I[0,0] = 0.
+    Phi = Phi.to(torch.float64)
+    uninverted = Phi.T @ Phi + lam * I  # m, m
+    res = torch.linalg.solve(uninverted, Phi.T @ y)
+    return res.to(torch.float32)
 
 
 def ridge_predict(Phi: Tensor, w: Tensor) -> Tensor:

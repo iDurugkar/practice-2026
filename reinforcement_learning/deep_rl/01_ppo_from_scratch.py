@@ -45,7 +45,9 @@ def orthogonal_init(layer: nn.Linear, gain: float = np.sqrt(2)) -> nn.Linear:
     TODO: Apply nn.init.orthogonal_ with the given gain to layer.weight,
     and nn.init.constant_ 0 to layer.bias. Return layer.
     """
-    raise NotImplementedError
+    nn.init.orthogonal_(layer.weight, gain)
+    nn.init.zeros_(layer.bias)
+    return layer
 
 
 class ActorCritic(nn.Module):
